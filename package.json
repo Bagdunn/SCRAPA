@@ -11,6 +11,7 @@
   "license": "ISC",
   "dependencies": {
     "fs": "^0.0.1-security",
+    "mongodb": "^6.13.1",
     "prompt-sync": "^4.2.0",
     "telegram": "^2.26.22"
   }
