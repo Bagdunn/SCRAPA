@@ -3,8 +3,8 @@ const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
 const path = require("path");
 const admin = require("firebase-admin");
+const axios = require("axios"); // Додали axios для запиту в OpenAI
 const prompt = require("prompt-sync")();
-
 
 const serviceAccount = require("./firebase-key.json");
 admin.initializeApp({
@@ -19,6 +19,7 @@ const apiId = config.api_id;
 const apiHash = config.api_hash;
 const forwardChatId = BigInt(config.forward_chat_id);
 const channelIds = new Set(config.channels.map(id => BigInt(id)));
+const openaiApiKey = config.openai_api_key; // Додаємо ключ OpenAI
 
 let session = new StringSession("");
 if (fs.existsSync("session.json")) {
@@ -30,14 +31,51 @@ const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 
 async function uploadToFirebase(localFilePath, fileName) {
     const file = bucket.file(`telegram_images/${fileName}`);
     await file.save(fs.readFileSync(localFilePath), { public: true });
-    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
-
-    console.log("Файл доступний за адресою:", publicUrl);
-
     return `https://storage.googleapis.com/${bucket.name}/telegram_images/${fileName}`;
-
 }
 
+// 🧠 Запит в OpenAI для фільтрації + визначення назви проєкту
+async function filterPostWithAI(text) {
+    try {
+        const response = await axios.post("https://api.openai.com/v1/chat/completions", {
+            model: "gpt-4o-mini",
+            messages: [{ role: "system", content: "Аналізуй текст і поверни назву проєкту, якщо він стосується конкретного проєкту. Якщо це спам або несуттєвий пост, поверни 'false'." }, { role: "user", content: text }],
+            temperature: 0.5
+        }, {
+            headers: { "Authorization": `Bearer ${openaiApiKey}` }
+        });
+
+        //console.log(response.data);
+
+        return response.data.choices[0].message.content.trim();
+    } catch (error) {
+        console.error("❌ Помилка OpenAI:", error.response ? error.response.data : error.message);
+        return "false";
+    }
+}
+
+// 🗑 Видалення старих постів (старших за 2 тижні)
+async function deleteOldPosts() {
+    const twoWeeksAgo = admin.firestore.Timestamp.fromMillis(Date.now() - 14 * 24 * 60 * 60 * 1000);
+    const snapshot = await db.collection("telegram_posts").where("createdAt", "<", twoWeeksAgo).get();
+
+    for (const doc of snapshot.docs) {
+        const data = doc.data();
+        if (data.media?.url) {
+            const fileName = data.media.url.split("/").pop();
+            try {
+                await bucket.file(`telegram_images/${fileName}`).delete();
+                console.log(`🗑 Видалено фото: ${fileName}`);
+            } catch (err) {
+                console.warn(`⚠️ Не вдалося видалити фото ${fileName}:`, err.message);
+            }
+        }
+        await db.collection("telegram_posts").doc(doc.id).delete();
+        console.log(`🗑 Видалено старий запис ID ${doc.id}`);
+    }
+}
+
+// Основний код
 (async () => {
     await client.start({
         phoneNumber: () => prompt("Введи номер телефону: "),
@@ -61,66 +99,63 @@ async function uploadToFirebase(localFilePath, fileName) {
                 console.log(`📩 Нове повідомлення з каналу ${formattedChannelId}`);
 
                 let mediaUrl = null;
-
-                const filePath = path.join(__dirname, "downloads", `${message.id}.jpg`);
-
-                if (!fs.existsSync(filePath)) {
-                    console.log(`❌ Файл ${filePath} не існує!`);
-                } else {
-                    console.log(`✅ Файл знайдено: ${filePath}`);
-                }
-
-                if (message.media && message.media.photo) {
+                if (message.media?.photo) {
                     const filePath = `./downloads/${message.id}.jpg`;
-
                     const result = await client.downloadMedia(message.media, { file: filePath });
                     fs.writeFileSync(filePath, result);
-                    if (result) {
-                        console.log(`✅ Файл успішно завантажений: ${filePath}`);
-                        console.log(result);
-                    } else {
-                        console.log(`❌ Помилка! Telegram повернув пустий результат.`);
-                    }
-
                     mediaUrl = await uploadToFirebase(filePath, `${message.id}.jpg`);
                     fs.unlinkSync(filePath);
                 }
 
+                const postText = message.message || "";
+                const projectName = await filterPostWithAI(postText);
+
+                if (projectName.toLowerCase() === "false") {
+                    console.log("❌ Пост відфільтровано, не зберігаємо.");
+                    return;
+                }
+
+                console.log(`✅ Пост пройшов перевірку. Проєкт: ${projectName}`);
+
+                // Перевіряємо, чи такий проєкт вже є в БД
+                
+                // const existingProject = await db.collection("telegram_posts")
+                //     .where("projectname", "==", projectName)
+                //     .limit(1)
+                //     .get();
+
+                // if (!existingProject.empty) {
+                //     console.log(`⚠️ Проєкт ${projectName} вже є в базі. Не зберігаємо дубль.`);
+                //     return;
+                // }
+
+                // Генеруємо ID
                 const counterRef = db.collection("counters").doc("posts");
                 const counterDoc = await counterRef.get();
-                let lastIndexId = 0;
-                if (counterDoc.exists) {
-                    lastIndexId = counterDoc.data().lastIndexId + 1;
-                }
+                let lastIndexId = counterDoc.exists ? counterDoc.data().lastIndexId + 1 : 1;
                 await counterRef.set({ lastIndexId });
-                const postRef = db.collection("telegram_posts").doc(lastIndexId.toString());
 
-                await postRef.set({
-                    indexId: lastIndexId, // Автоінкрементоване ID
+                await db.collection("telegram_posts").doc(lastIndexId.toString()).set({
+                    indexId: lastIndexId,
                     chatId: formattedChannelId.toString(),
-                    postId: message.id, // Оригінальний Telegram ID
-                    text: message.message || "",
+                    postId: message.id,
+                    text: postText,
                     media: mediaUrl ? { type: "photo", url: mediaUrl } : null,
+                    projectname: projectName,
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 });
 
-
-                // await db.collection("telegram_posts").doc(`${message.id}`).set({
-                //     id: message.id,
-                //     chatId: formattedChannelId.toString(),
-                //     text: message.message || "",
-                //     media: mediaUrl ? { type: "photo", url: mediaUrl } : null,
-                //     timestamp: admin.firestore.Timestamp.now(),
-                // });
-
                 await client.sendMessage(forwardChatId, {
-                    message: message.message,
+                    message: postText,
                     entities: message.entities,
                     ...(mediaUrl && { media: message.media })
                 });
 
-                console.log("✅ Повідомлення відправлено і збережено в Firebase!");
+                console.log("✅ Повідомлення збережено в Firebase!");
             }
         }
     });
+
+    // Запускаємо видалення старих записів раз в день
+    setInterval(deleteOldPosts, 24 * 60 * 60 * 1000);
 })();
