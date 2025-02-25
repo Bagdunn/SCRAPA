@@ -10,6 +10,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "firebase": "^11.3.1",
+    "firebase-admin": "^13.1.0",
     "fs": "^0.0.1-security",
     "mongodb": "^6.13.1",
     "prompt-sync": "^4.2.0",
